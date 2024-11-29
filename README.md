@@ -1,2 +1,2 @@
 # Map_GPT
-A nlp model which creates maps!
+A nlp model which creates maps from prompts!
