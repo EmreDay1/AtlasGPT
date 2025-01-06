@@ -1,10 +1,11 @@
 import pandas as pd
+import numpy as np
 import torch
 from torch.utils.data import DataLoader, Dataset
 from transformers import AutoTokenizer, AutoModelForSequenceClassification, AdamW
 from sklearn.model_selection import train_test_split
 from tqdm import tqdm
-from sklearn.metrics import precision_recall_fscore_support, confusion_matrix
+
 
 class PromptDataset(Dataset):
     def __init__(self, texts, labels, tokenizer, max_len):
@@ -35,6 +36,31 @@ class PromptDataset(Dataset):
             'labels': torch.tensor(label, dtype=torch.long)
         }
 
+
+def load_data_from_file(file_name, label):
+    with open(file_name, 'r', encoding='utf-8') as file:
+        lines = [line.strip() for line in file if line.strip()]
+    return pd.DataFrame({'text': lines, 'label': [label] * len(lines)})
+
+
+def load_dataset():
+    multitask_data = load_data_from_file('multitask_prompts.txt', 0)
+    geospatial_data = load_data_from_file('geospatial_prompts.txt', 1)
+    weather_data = load_data_from_file('weather_prompts.txt', 2)
+    combined_df = pd.concat([multitask_data, geospatial_data, weather_data])
+    return combined_df
+
+
+df = load_dataset()
+train_df, val_df = train_test_split(df, test_size=0.2, random_state=42)
+
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+tokenizer = AutoTokenizer.from_pretrained('distilbert-base-uncased')
+model = AutoModelForSequenceClassification.from_pretrained('distilbert-base-uncased', num_labels=3)
+model.to(device)
+
+
 def create_data_loader(df, tokenizer, max_len, batch_size):
     ds = PromptDataset(
         texts=df['text'].to_numpy(),
@@ -44,61 +70,56 @@ def create_data_loader(df, tokenizer, max_len, batch_size):
     )
     return DataLoader(ds, batch_size=batch_size, num_workers=4)
 
-def train_epoch(model, data_loader, optimizer, device, scheduler=None):
-    model = model.train()
-    losses = []
-    correct_predictions = 0
-    total_predictions = 0
-    for d in data_loader:
-        input_ids = d['input_ids'].to(device)
-        attention_mask = d['attention_mask'].to(device)
-        labels = d['labels'].to(device)
-        outputs = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
-        _, preds = torch.max(outputs.logits, dim=1)
-        loss = outputs.loss
-        correct_predictions += torch.sum(preds == labels)
-        total_predictions += labels.size(0)
-        losses.append(loss.item())
-        loss.backward()
-        optimizer.step()
-        optimizer.zero_grad()
-    accuracy = correct_predictions.double() / total_predictions
-    return accuracy, np.mean(losses)
-
-def eval_model(model, data_loader, device):
-    model = model.eval()
-    losses = []
-    correct_predictions = 0
-    total_predictions = 0
-    with torch.no_grad():
-        for d in data_loader:
-            input_ids = d['input_ids'].to(device)
-            attention_mask = d['attention_mask'].to(device)
-            labels = d['labels'].to(device)
-            outputs = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
-            _, preds = torch.max(outputs.logits, dim=1)
-            loss = outputs.loss
-            correct_predictions += torch.sum(preds == labels)
-            total_predictions += labels.size(0)
-            losses.append(loss.item())
-    accuracy = correct_predictions.double() / total_predictions
-    return accuracy, np.mean(losses)
-
-tokenizer = AutoTokenizer.from_pretrained('distilbert-base-uncased')
-model = AutoModelForSequenceClassification.from_pretrained('distilbert-base-uncased', num_labels=3)
-model.to(device)
-
 train_data_loader = create_data_loader(train_df, tokenizer, 128, 16)
 val_data_loader = create_data_loader(val_df, tokenizer, 128, 16)
+
 
 optimizer = AdamW(model.parameters(), lr=2e-5, correct_bias=False)
 EPOCHS = 50
 
 for epoch in range(EPOCHS):
-    train_acc, train_loss = train_epoch(model, train_data_loader, optimizer, device)
-    val_acc, val_loss = eval_model(model, val_data_loader, device)
-    print(f'Epoch {epoch + 1}/{EPOCHS}, Train Loss: {train_loss:.5f}, Train Acc: {train_acc:.5f}, Val Loss: {val_loss:.5f}, Val Acc: {val_acc:.5f}')
+    total_train_loss = 0
+    total_train_accuracy = 0
+    for batch in train_data_loader:
+        input_ids = batch['input_ids'].to(device)
+        attention_mask = batch['attention_mask'].to(device)
+        labels = batch['labels'].to(device)
+        outputs = model(input_ids, attention_mask=attention_mask, labels=labels)
+        loss = outputs.loss
+        preds = outputs.logits.argmax(dim=1)
+        accuracy = (preds == labels).float().mean()
 
-# Save the model
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+
+        total_train_loss += loss.item()
+        total_train_accuracy += accuracy.item()
+
+    avg_train_loss = total_train_loss / len(train_data_loader)
+    avg_train_accuracy = total_train_accuracy / len(train_data_loader)
+
+    total_val_loss = 0
+    total_val_accuracy = 0
+    model.eval()
+    with torch.no_grad():
+        for batch in val_data_loader:
+            input_ids = batch['input_ids'].to(device)
+            attention_mask = batch['attention_mask'].to(device)
+            labels = batch['labels'].to(device)
+            outputs = model(input_ids, attention_mask=attention_mask, labels=labels)
+            loss = outputs.loss
+            preds = outputs.logits.argmax(dim=1)
+            accuracy = (preds == labels).float().mean()
+
+            total_val_loss += loss.item()
+            total_val_accuracy += accuracy.item()
+
+    avg_val_loss = total_val_loss / len(val_data_loader)
+    avg_val_accuracy = total_val_accuracy / len(val_data_loader)
+
+    print(f'Epoch {epoch + 1}/{EPOCHS}: Train Loss = {avg_train_loss:.4f}, Train Acc = {avg_train_accuracy:.4f}, Val Loss = {avg_val_loss:.4f}, Val Acc = {avg_val_accuracy:.4f}')
+
+
 model.save_pretrained("Map_Generation_Model")
 tokenizer.save_pretrained("Map_Generation_Model")
